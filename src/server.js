@@ -47,7 +47,39 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Files endpoint (requires API key)
+// Function to fetch all updates recursively
+async function fetchAllUpdates(offset = 0, allUpdates = []) {
+  try {
+    const response = await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&limit=100`
+    );
+    
+    if (!response.data.ok || response.data.result.length === 0) {
+      return allUpdates; // No more updates
+    }
+    
+    const newUpdates = response.data.result;
+    const lastUpdateId = newUpdates[newUpdates.length - 1].update_id;
+    
+    // Add new updates to the collection
+    allUpdates = allUpdates.concat(newUpdates);
+    
+    // Set offset to the next update_id
+    const newOffset = lastUpdateId + 1;
+    
+    // Add a small delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 50));
+    
+    // Recursively fetch more updates
+    return fetchAllUpdates(newOffset, allUpdates);
+    
+  } catch (error) {
+    console.error('Error in fetchAllUpdates:', error.message);
+    return allUpdates; // Return whatever we've collected so far
+  }
+}
+
+// Files endpoint (requires API key) - Now fetches unlimited files
 app.get('/api/files', validateApiKey, async (req, res) => {
   try {
     if (!BOT_TOKEN) {
@@ -57,49 +89,76 @@ app.get('/api/files', validateApiKey, async (req, res) => {
       });
     }
     
-    const response = await axios.get(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=10`
-    );
+    console.log('Fetching all available files...');
+    
+    // Fetch ALL updates
+    const allUpdates = await fetchAllUpdates();
+    
+    console.log(`Found ${allUpdates.length} total updates`);
     
     const files = [];
+    const processedFileIds = new Set(); // To avoid duplicates
     
-    if (response.data.ok) {
-      const updates = response.data.result;
-      
-      for (const update of updates) {
-        if (update.message) {
-          const message = update.message;
-          
-          // Process different file types
-          if (message.document) {
-            const filePath = await getFilePath(message.document.file_id);
-            if (filePath) {
-              files.push(createFileObject(message.document, filePath, 'document'));
-            }
+    // Process each update for files
+    for (const update of allUpdates) {
+      if (update.message) {
+        const message = update.message;
+        
+        // Process different file types
+        if (message.document && !processedFileIds.has(message.document.file_id)) {
+          const filePath = await getFilePath(message.document.file_id);
+          if (filePath) {
+            files.push(createFileObject(message.document, filePath, 'document'));
+            processedFileIds.add(message.document.file_id);
           }
-          
-          if (message.photo && message.photo.length > 0) {
-            const largestPhoto = message.photo[message.photo.length - 1];
+        }
+        
+        if (message.photo && message.photo.length > 0) {
+          const largestPhoto = message.photo[message.photo.length - 1];
+          if (!processedFileIds.has(largestPhoto.file_id)) {
             const filePath = await getFilePath(largestPhoto.file_id);
             if (filePath) {
               files.push(createFileObject(largestPhoto, filePath, 'photo', 'Photo.jpg'));
+              processedFileIds.add(largestPhoto.file_id);
             }
           }
-          
-          if (message.video) {
-            const filePath = await getFilePath(message.video.file_id);
-            if (filePath) {
-              files.push(createFileObject(message.video, filePath, 'video'));
-            }
+        }
+        
+        if (message.video && !processedFileIds.has(message.video.file_id)) {
+          const filePath = await getFilePath(message.video.file_id);
+          if (filePath) {
+            files.push(createFileObject(message.video, filePath, 'video'));
+            processedFileIds.add(message.video.file_id);
+          }
+        }
+        
+        // Add support for more file types if needed
+        if (message.audio && !processedFileIds.has(message.audio.file_id)) {
+          const filePath = await getFilePath(message.audio.file_id);
+          if (filePath) {
+            files.push(createFileObject(message.audio, filePath, 'audio'));
+            processedFileIds.add(message.audio.file_id);
+          }
+        }
+        
+        if (message.voice && !processedFileIds.has(message.voice.file_id)) {
+          const filePath = await getFilePath(message.voice.file_id);
+          if (filePath) {
+            files.push(createFileObject(message.voice, filePath, 'voice', 'Voice.ogg'));
+            processedFileIds.add(message.voice.file_id);
           }
         }
       }
     }
     
+    console.log(`Processed ${files.length} unique files`);
+    
     res.json({ 
       success: true, 
       count: files.length,
-      files: files 
+      totalUpdates: allUpdates.length,
+      files: files,
+      timestamp: new Date().toISOString()
     });
     
   } catch (error) {
@@ -119,7 +178,8 @@ function createFileObject(fileData, filePath, type, defaultName = null) {
     filePath: filePath,
     directLink: `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
     type: type,
-    fileSize: fileData.file_size || null
+    fileSize: fileData.file_size || null,
+    mimeType: fileData.mime_type || null
   };
 }
 
