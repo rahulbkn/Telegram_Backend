@@ -1,8 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -17,23 +15,9 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_KEY = process.env.API_KEY;
 const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 
-// Initialize SQLite database
-const dbPath = path.join(__dirname, 'database.sqlite');
-const db = new sqlite3.Database(dbPath);
-
-// Create files table if not exists
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fileId TEXT UNIQUE,
-    fileName TEXT,
-    filePath TEXT,
-    type TEXT,
-    fileSize INTEGER,
-    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-    isDeleted BOOLEAN DEFAULT FALSE
-  )`);
-});
+// In-memory storage for files (for demo purposes)
+// In production, use a proper database like MongoDB, PostgreSQL, etc.
+let filesStorage = [];
 
 // API Key validation middleware
 const validateApiKey = (req, res, next) => {
@@ -65,6 +49,7 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     hasBotToken: !!BOT_TOKEN,
     hasApiKey: !!API_KEY,
+    totalFiles: filesStorage.length,
     webhookUrl: `${SERVER_URL}/webhook`
   });
 });
@@ -72,34 +57,16 @@ app.get('/api/health', (req, res) => {
 // Get all files endpoint
 app.get('/api/files', validateApiKey, async (req, res) => {
   try {
-    db.all(
-      'SELECT * FROM files WHERE isDeleted = FALSE ORDER BY createdAt DESC',
-      (err, rows) => {
-        if (err) {
-          console.error('Database error:', err);
-          return res.status(500).json({ 
-            error: 'Database error',
-            message: err.message 
-          });
-        }
-
-        const files = rows.map(row => ({
-          fileId: row.fileId,
-          fileName: row.fileName,
-          filePath: row.filePath,
-          directLink: `https://api.telegram.org/file/bot${BOT_TOKEN}/${row.filePath}`,
-          type: row.type,
-          fileSize: row.fileSize,
-          createdAt: row.createdAt
-        }));
-
-        res.json({ 
-          success: true, 
-          count: files.length,
-          files: files 
-        });
-      }
-    );
+    // Fetch latest updates from Telegram to ensure we have current files
+    await syncFilesFromTelegram();
+    
+    const activeFiles = filesStorage.filter(file => !file.isDeleted);
+    
+    res.json({ 
+      success: true, 
+      count: activeFiles.length,
+      files: activeFiles 
+    });
   } catch (error) {
     console.error('Error fetching files:', error);
     res.status(500).json({ 
@@ -114,32 +81,22 @@ app.delete('/api/files/:fileId', validateApiKey, async (req, res) => {
   try {
     const { fileId } = req.params;
     
-    db.run(
-      'UPDATE files SET isDeleted = TRUE WHERE fileId = ?',
-      [fileId],
-      function(err) {
-        if (err) {
-          console.error('Database error:', err);
-          return res.status(500).json({ 
-            error: 'Database error',
-            message: err.message 
-          });
-        }
-
-        if (this.changes === 0) {
-          return res.status(404).json({ 
-            error: 'File not found',
-            message: 'The specified file ID does not exist' 
-          });
-        }
-
-        res.json({ 
-          success: true, 
-          message: 'File deleted successfully',
-          fileId: fileId
-        });
-      }
-    );
+    const fileIndex = filesStorage.findIndex(file => file.fileId === fileId && !file.isDeleted);
+    
+    if (fileIndex === -1) {
+      return res.status(404).json({ 
+        error: 'File not found',
+        message: 'The specified file ID does not exist' 
+      });
+    }
+    
+    filesStorage[fileIndex].isDeleted = true;
+    
+    res.json({ 
+      success: true, 
+      message: 'File deleted successfully',
+      fileId: fileId
+    });
   } catch (error) {
     console.error('Error deleting file:', error);
     res.status(500).json({ 
@@ -149,34 +106,29 @@ app.delete('/api/files/:fileId', validateApiKey, async (req, res) => {
   }
 });
 
-// Webhook endpoint for Telegram updates
-app.post('/webhook', async (req, res) => {
+// Sync files from Telegram
+async function syncFilesFromTelegram() {
   try {
-    console.log('Webhook received:', req.body);
+    if (!BOT_TOKEN) return;
     
-    if (req.body.message) {
-      const message = req.body.message;
-      
-      // Handle new files
-      if (message.document || message.photo || message.video) {
-        await handleNewFile(message);
-      }
-      
-      // Handle delete commands
-      if (message.text && message.text.startsWith('/delete')) {
-        await handleDeleteCommand(message);
+    const response = await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=100`
+    );
+    
+    if (response.data.ok && response.data.result) {
+      for (const update of response.data.result) {
+        if (update.message) {
+          await processMessage(update.message);
+        }
       }
     }
-    
-    res.status(200).send('OK');
   } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(500).send('Error');
+    console.error('Error syncing files from Telegram:', error);
   }
-});
+}
 
-// Helper function to handle new file
-async function handleNewFile(message) {
+// Process Telegram message
+async function processMessage(message) {
   try {
     let fileData = null;
     let fileType = '';
@@ -196,28 +148,49 @@ async function handleNewFile(message) {
       defaultName = message.video.file_name || 'Video.mp4';
     }
 
-    if (fileData) {
+    if (fileData && !filesStorage.some(f => f.fileId === fileData.file_id)) {
       const filePath = await getFilePath(fileData.file_id);
       
       if (filePath) {
-        db.run(
-          `INSERT OR REPLACE INTO files (fileId, fileName, filePath, type, fileSize) 
-           VALUES (?, ?, ?, ?, ?)`,
-          [fileData.file_id, defaultName, filePath, fileType, fileData.file_size],
-          function(err) {
-            if (err) {
-              console.error('Error saving file to database:', err);
-            } else {
-              console.log('File saved to database:', fileData.file_id);
-            }
-          }
-        );
+        filesStorage.push({
+          fileId: fileData.file_id,
+          fileName: defaultName,
+          filePath: filePath,
+          directLink: `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
+          type: fileType,
+          fileSize: fileData.file_size || null,
+          createdAt: new Date().toISOString(),
+          isDeleted: false
+        });
+        
+        console.log('File added to storage:', fileData.file_id);
       }
     }
+    
+    // Handle delete commands
+    if (message.text && message.text.startsWith('/delete')) {
+      await handleDeleteCommand(message);
+    }
   } catch (error) {
-    console.error('Error handling new file:', error);
+    console.error('Error processing message:', error);
   }
 }
+
+// Webhook endpoint for Telegram updates
+app.post('/webhook', async (req, res) => {
+  try {
+    console.log('Webhook received');
+    
+    if (req.body.message) {
+      await processMessage(req.body.message);
+    }
+    
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).send('Error');
+  }
+});
 
 // Helper function to handle delete command
 async function handleDeleteCommand(message) {
@@ -225,21 +198,15 @@ async function handleDeleteCommand(message) {
     const parts = message.text.split(' ');
     if (parts.length === 2) {
       const fileId = parts[1];
+      const fileIndex = filesStorage.findIndex(file => file.fileId === fileId);
       
-      db.run(
-        'UPDATE files SET isDeleted = TRUE WHERE fileId = ?',
-        [fileId],
-        function(err) {
-          if (err) {
-            console.error('Error deleting file:', err);
-          } else if (this.changes > 0) {
-            console.log('File marked as deleted:', fileId);
-            sendMessage(message.chat.id, `File ${fileId} has been deleted.`);
-          } else {
-            sendMessage(message.chat.id, `File ${fileId} not found.`);
-          }
-        }
-      );
+      if (fileIndex !== -1) {
+        filesStorage[fileIndex].isDeleted = true;
+        console.log('File marked as deleted via bot command:', fileId);
+        await sendMessage(message.chat.id, `File ${fileId} has been deleted.`);
+      } else {
+        await sendMessage(message.chat.id, `File ${fileId} not found.`);
+      }
     }
   } catch (error) {
     console.error('Error handling delete command:', error);
@@ -304,19 +271,14 @@ app.listen(PORT, async () => {
   console.log(`API_KEY configured: ${!!API_KEY}`);
   console.log(`Server URL: ${SERVER_URL}`);
   
-  // Setup webhook
-  await setupWebhook();
-});
-
-// Close database connection on exit
-process.on('SIGINT', () => {
-  db.close((err) => {
-    if (err) {
-      console.error(err.message);
-    }
-    console.log('Database connection closed.');
-    process.exit(0);
-  });
+  // Initial sync of files
+  await syncFilesFromTelegram();
+  console.log(`Initial sync completed. Found ${filesStorage.length} files`);
+  
+  // Setup webhook if SERVER_URL is configured
+  if (SERVER_URL && SERVER_URL !== `http://localhost:${PORT}`) {
+    await setupWebhook();
+  }
 });
 
 module.exports = app;
