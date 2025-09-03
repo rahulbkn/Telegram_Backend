@@ -1,6 +1,8 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -13,6 +15,25 @@ app.use(express.json());
 // Environment variables
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const API_KEY = process.env.API_KEY;
+const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
+
+// Initialize SQLite database
+const dbPath = path.join(__dirname, 'database.sqlite');
+const db = new sqlite3.Database(dbPath);
+
+// Create files table if not exists
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fileId TEXT UNIQUE,
+    fileName TEXT,
+    filePath TEXT,
+    type TEXT,
+    fileSize INTEGER,
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    isDeleted BOOLEAN DEFAULT FALSE
+  )`);
+});
 
 // API Key validation middleware
 const validateApiKey = (req, res, next) => {
@@ -43,124 +64,42 @@ app.get('/api/health', (req, res) => {
     server: 'Render',
     timestamp: new Date().toISOString(),
     hasBotToken: !!BOT_TOKEN,
-    hasApiKey: !!API_KEY
+    hasApiKey: !!API_KEY,
+    webhookUrl: `${SERVER_URL}/webhook`
   });
 });
 
-// Function to fetch all updates recursively
-async function fetchAllUpdates(offset = 0, allUpdates = []) {
-  try {
-    const response = await axios.get(
-      `https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${offset}&limit=100`
-    );
-    
-    if (!response.data.ok || response.data.result.length === 0) {
-      return allUpdates; // No more updates
-    }
-    
-    const newUpdates = response.data.result;
-    const lastUpdateId = newUpdates[newUpdates.length - 1].update_id;
-    
-    // Add new updates to the collection
-    allUpdates = allUpdates.concat(newUpdates);
-    
-    // Set offset to the next update_id
-    const newOffset = lastUpdateId + 1;
-    
-    // Add a small delay to avoid rate limiting
-    await new Promise(resolve => setTimeout(resolve, 50));
-    
-    // Recursively fetch more updates
-    return fetchAllUpdates(newOffset, allUpdates);
-    
-  } catch (error) {
-    console.error('Error in fetchAllUpdates:', error.message);
-    return allUpdates; // Return whatever we've collected so far
-  }
-}
-
-// Files endpoint (requires API key) - Now fetches unlimited files
+// Get all files endpoint
 app.get('/api/files', validateApiKey, async (req, res) => {
   try {
-    if (!BOT_TOKEN) {
-      return res.status(500).json({ 
-        error: 'Server configuration error',
-        message: 'Bot token not configured on server' 
-      });
-    }
-    
-    console.log('Fetching all available files...');
-    
-    // Fetch ALL updates
-    const allUpdates = await fetchAllUpdates();
-    
-    console.log(`Found ${allUpdates.length} total updates`);
-    
-    const files = [];
-    const processedFileIds = new Set(); // To avoid duplicates
-    
-    // Process each update for files
-    for (const update of allUpdates) {
-      if (update.message) {
-        const message = update.message;
-        
-        // Process different file types
-        if (message.document && !processedFileIds.has(message.document.file_id)) {
-          const filePath = await getFilePath(message.document.file_id);
-          if (filePath) {
-            files.push(createFileObject(message.document, filePath, 'document'));
-            processedFileIds.add(message.document.file_id);
-          }
+    db.all(
+      'SELECT * FROM files WHERE isDeleted = FALSE ORDER BY createdAt DESC',
+      (err, rows) => {
+        if (err) {
+          console.error('Database error:', err);
+          return res.status(500).json({ 
+            error: 'Database error',
+            message: err.message 
+          });
         }
-        
-        if (message.photo && message.photo.length > 0) {
-          const largestPhoto = message.photo[message.photo.length - 1];
-          if (!processedFileIds.has(largestPhoto.file_id)) {
-            const filePath = await getFilePath(largestPhoto.file_id);
-            if (filePath) {
-              files.push(createFileObject(largestPhoto, filePath, 'photo', 'Photo.jpg'));
-              processedFileIds.add(largestPhoto.file_id);
-            }
-          }
-        }
-        
-        if (message.video && !processedFileIds.has(message.video.file_id)) {
-          const filePath = await getFilePath(message.video.file_id);
-          if (filePath) {
-            files.push(createFileObject(message.video, filePath, 'video'));
-            processedFileIds.add(message.video.file_id);
-          }
-        }
-        
-        // Add support for more file types if needed
-        if (message.audio && !processedFileIds.has(message.audio.file_id)) {
-          const filePath = await getFilePath(message.audio.file_id);
-          if (filePath) {
-            files.push(createFileObject(message.audio, filePath, 'audio'));
-            processedFileIds.add(message.audio.file_id);
-          }
-        }
-        
-        if (message.voice && !processedFileIds.has(message.voice.file_id)) {
-          const filePath = await getFilePath(message.voice.file_id);
-          if (filePath) {
-            files.push(createFileObject(message.voice, filePath, 'voice', 'Voice.ogg'));
-            processedFileIds.add(message.voice.file_id);
-          }
-        }
+
+        const files = rows.map(row => ({
+          fileId: row.fileId,
+          fileName: row.fileName,
+          filePath: row.filePath,
+          directLink: `https://api.telegram.org/file/bot${BOT_TOKEN}/${row.filePath}`,
+          type: row.type,
+          fileSize: row.fileSize,
+          createdAt: row.createdAt
+        }));
+
+        res.json({ 
+          success: true, 
+          count: files.length,
+          files: files 
+        });
       }
-    }
-    
-    console.log(`Processed ${files.length} unique files`);
-    
-    res.json({ 
-      success: true, 
-      count: files.length,
-      totalUpdates: allUpdates.length,
-      files: files,
-      timestamp: new Date().toISOString()
-    });
-    
+    );
   } catch (error) {
     console.error('Error fetching files:', error);
     res.status(500).json({ 
@@ -170,17 +109,141 @@ app.get('/api/files', validateApiKey, async (req, res) => {
   }
 });
 
-// Helper function to create file object
-function createFileObject(fileData, filePath, type, defaultName = null) {
-  return {
-    fileId: fileData.file_id,
-    fileName: fileData.file_name || defaultName || 'File',
-    filePath: filePath,
-    directLink: `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
-    type: type,
-    fileSize: fileData.file_size || null,
-    mimeType: fileData.mime_type || null
-  };
+// Delete file endpoint
+app.delete('/api/files/:fileId', validateApiKey, async (req, res) => {
+  try {
+    const { fileId } = req.params;
+    
+    db.run(
+      'UPDATE files SET isDeleted = TRUE WHERE fileId = ?',
+      [fileId],
+      function(err) {
+        if (err) {
+          console.error('Database error:', err);
+          return res.status(500).json({ 
+            error: 'Database error',
+            message: err.message 
+          });
+        }
+
+        if (this.changes === 0) {
+          return res.status(404).json({ 
+            error: 'File not found',
+            message: 'The specified file ID does not exist' 
+          });
+        }
+
+        res.json({ 
+          success: true, 
+          message: 'File deleted successfully',
+          fileId: fileId
+        });
+      }
+    );
+  } catch (error) {
+    console.error('Error deleting file:', error);
+    res.status(500).json({ 
+      error: 'Failed to delete file',
+      message: error.message 
+    });
+  }
+});
+
+// Webhook endpoint for Telegram updates
+app.post('/webhook', async (req, res) => {
+  try {
+    console.log('Webhook received:', req.body);
+    
+    if (req.body.message) {
+      const message = req.body.message;
+      
+      // Handle new files
+      if (message.document || message.photo || message.video) {
+        await handleNewFile(message);
+      }
+      
+      // Handle delete commands
+      if (message.text && message.text.startsWith('/delete')) {
+        await handleDeleteCommand(message);
+      }
+    }
+    
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).send('Error');
+  }
+});
+
+// Helper function to handle new file
+async function handleNewFile(message) {
+  try {
+    let fileData = null;
+    let fileType = '';
+    let defaultName = '';
+
+    if (message.document) {
+      fileData = message.document;
+      fileType = 'document';
+      defaultName = fileData.file_name || 'Document';
+    } else if (message.photo && message.photo.length > 0) {
+      fileData = message.photo[message.photo.length - 1];
+      fileType = 'photo';
+      defaultName = 'Photo.jpg';
+    } else if (message.video) {
+      fileData = message.video;
+      fileType = 'video';
+      defaultName = message.video.file_name || 'Video.mp4';
+    }
+
+    if (fileData) {
+      const filePath = await getFilePath(fileData.file_id);
+      
+      if (filePath) {
+        db.run(
+          `INSERT OR REPLACE INTO files (fileId, fileName, filePath, type, fileSize) 
+           VALUES (?, ?, ?, ?, ?)`,
+          [fileData.file_id, defaultName, filePath, fileType, fileData.file_size],
+          function(err) {
+            if (err) {
+              console.error('Error saving file to database:', err);
+            } else {
+              console.log('File saved to database:', fileData.file_id);
+            }
+          }
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Error handling new file:', error);
+  }
+}
+
+// Helper function to handle delete command
+async function handleDeleteCommand(message) {
+  try {
+    const parts = message.text.split(' ');
+    if (parts.length === 2) {
+      const fileId = parts[1];
+      
+      db.run(
+        'UPDATE files SET isDeleted = TRUE WHERE fileId = ?',
+        [fileId],
+        function(err) {
+          if (err) {
+            console.error('Error deleting file:', err);
+          } else if (this.changes > 0) {
+            console.log('File marked as deleted:', fileId);
+            sendMessage(message.chat.id, `File ${fileId} has been deleted.`);
+          } else {
+            sendMessage(message.chat.id, `File ${fileId} not found.`);
+          }
+        }
+      );
+    }
+  } catch (error) {
+    console.error('Error handling delete command:', error);
+  }
 }
 
 // Helper function to get file path
@@ -196,17 +259,64 @@ async function getFilePath(fileId) {
   }
 }
 
+// Helper function to send message
+async function sendMessage(chatId, text) {
+  try {
+    await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(text)}`
+    );
+  } catch (error) {
+    console.error('Error sending message:', error);
+  }
+}
+
+// Setup Telegram webhook
+async function setupWebhook() {
+  try {
+    const webhookUrl = `${SERVER_URL}/webhook`;
+    const response = await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`
+    );
+    console.log('Webhook setup result:', response.data);
+  } catch (error) {
+    console.error('Error setting up webhook:', error);
+  }
+}
+
 // 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({ 
     error: 'Endpoint not found',
     path: req.originalUrl,
-    availableEndpoints: ['/api/health', '/api/files'] 
+    availableEndpoints: [
+      '/api/health', 
+      '/api/files', 
+      '/api/files/:fileId (DELETE)',
+      '/webhook (POST)'
+    ] 
   });
 });
 
-app.listen(PORT, () => {
+// Start server
+app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`BOT_TOKEN configured: ${!!BOT_TOKEN}`);
   console.log(`API_KEY configured: ${!!API_KEY}`);
+  console.log(`Server URL: ${SERVER_URL}`);
+  
+  // Setup webhook
+  await setupWebhook();
 });
+
+// Close database connection on exit
+process.on('SIGINT', () => {
+  db.close((err) => {
+    if (err) {
+      console.error(err.message);
+    }
+    console.log('Database connection closed.');
+    process.exit(0);
+  });
+});
+
+module.exports = app;
