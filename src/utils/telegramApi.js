@@ -1,23 +1,32 @@
 const fetch = require("node-fetch");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const BASE_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const BASE_URL = `https://api.telegram.org/file/bot${BOT_TOKEN}`;
 
-let lastUpdateId = 0; // track where we left off
-
-// Fetch updates from Telegram
-async function getUpdates(limit = 20) {
+// Fetch ALL updates from Telegram (without offset tracking)
+async function getAllUpdates() {
   try {
-    const url = `${BASE_URL}/getUpdates?offset=${lastUpdateId + 1}&limit=${limit}`;
-    const response = await fetch(url);
-    const data = await response.json();
-
-    if (data.ok && data.result.length > 0) {
-      // update offset so old updates are skipped next time
-      lastUpdateId = data.result[data.result.length - 1].update_id;
+    let allUpdates = [];
+    let offset = 0;
+    let hasMore = true;
+    
+    while (hasMore) {
+      const url = `${BASE_URL}/getUpdates?offset=${offset}&limit=100`;
+      const response = await fetch(url);
+      const data = await response.json();
+      
+      if (data.ok && data.result.length > 0) {
+        allUpdates = allUpdates.concat(data.result);
+        offset = data.result[data.result.length - 1].update_id + 1;
+        
+        // Add small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 50));
+      } else {
+        hasMore = false;
+      }
     }
-
-    return data;
+    
+    return { ok: true, result: allUpdates };
   } catch (err) {
     console.error("Error fetching updates:", err);
     return { ok: false, result: [] };
@@ -41,6 +50,6 @@ async function getFilePath(fileId) {
 }
 
 module.exports = {
-  getUpdates,
+  getAllUpdates, // Changed from getUpdates
   getFilePath,
 };
