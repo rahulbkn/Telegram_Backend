@@ -1,5 +1,5 @@
-const fetch = require("node-fetch");
-const db = require("../models/File");
+File fetch = require("node-fetch");
+const db = require("../File");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BASE_URL = `https://api.telegram.org/bot${BOT_TOKEN}`;
